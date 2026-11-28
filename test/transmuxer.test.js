@@ -830,6 +830,125 @@ QUnit.test('Correctly parses multiple PTS rollovers', function(assert) {
   assert.equal(packets[9].pts, (3 * maxTS) + 1, 'correctly parsed the pts value');
 });
 
+QUnit.test('Does not fold a large forward seek into a negative timestamp', function(assert) {
+  var
+    packets = [],
+    packetData = [0x01, 0x02],
+    // A long recording scrubbed far forward: previous frame at 1000, the next
+    // wire frame lands past 2^32 at 5000001000. This is a seek, not a rollover.
+    pesHeadOne = pesHeader(false, 1000, 2),
+    pesHeadTwo = pesHeader(false, 5000001000, 2);
+
+  timestampRolloverStream.on('data', function(packet) {
+    packets.push(packet);
+  });
+
+  elementaryStream.push({
+    type: 'pes',
+    streamType: ADTS_STREAM_TYPE,
+    payloadUnitStartIndicator: true,
+    data: new Uint8Array(pesHeadOne.concat(packetData))
+  });
+  elementaryStream.push({
+    type: 'pes',
+    streamType: ADTS_STREAM_TYPE,
+    payloadUnitStartIndicator: true,
+    data: new Uint8Array(pesHeadTwo.concat(packetData))
+  });
+  elementaryStream.flush();
+
+  assert.equal(packets.length, 2, 'built two packets');
+  assert.equal(packets[0].pts, 1000, 'keeps the first timestamp');
+  assert.equal(packets[1].pts, 5000001000,
+    'keeps the seeked timestamp on the wire instead of folding it negative');
+});
+
+QUnit.test('Unwraps a real rollover and a backwards scrub across zero', function(assert) {
+  var
+    maxTS = 8589934592,
+    packets = [],
+    packetData = [0x01, 0x02],
+    // Real rollover: stored value drops from near 2^33 to 200.
+    rolloverHead = pesHeader(false, maxTS - 592, 2),
+    rolloverLanding = pesHeader(false, 200, 2),
+    // Backwards scrub across zero: 100 -> 2^33 - 92 must unwrap to -92.
+    scrubHead = pesHeader(false, 100, 2),
+    scrubLanding = pesHeader(false, maxTS - 92, 2);
+
+  timestampRolloverStream.on('data', function(packet) {
+    packets.push(packet);
+  });
+
+  // Real rollover pair.
+  elementaryStream.push({
+    type: 'pes',
+    streamType: ADTS_STREAM_TYPE,
+    payloadUnitStartIndicator: true,
+    data: new Uint8Array(rolloverHead.concat(packetData))
+  });
+  elementaryStream.push({
+    type: 'pes',
+    streamType: ADTS_STREAM_TYPE,
+    payloadUnitStartIndicator: true,
+    data: new Uint8Array(rolloverLanding.concat(packetData))
+  });
+  elementaryStream.flush();
+
+  assert.equal(packets[1].pts, maxTS + 200, 'unwraps the rollover into the next cycle');
+
+  // Backwards scrub pair on a fresh stream (discontinuity resets state).
+  timestampRolloverStream.discontinuity();
+  packets = [];
+  elementaryStream.push({
+    type: 'pes',
+    streamType: ADTS_STREAM_TYPE,
+    payloadUnitStartIndicator: true,
+    data: new Uint8Array(scrubHead.concat(packetData))
+  });
+  elementaryStream.push({
+    type: 'pes',
+    streamType: ADTS_STREAM_TYPE,
+    payloadUnitStartIndicator: true,
+    data: new Uint8Array(scrubLanding.concat(packetData))
+  });
+  elementaryStream.flush();
+
+  assert.equal(packets[1].pts, -92,
+    'unwraps the backwards scrub across zero to a small negative timestamp');
+});
+
+QUnit.test('Leaves adjacent small steps and repeated seeks untouched', function(assert) {
+  var
+    packets = [],
+    packetData = [0x01, 0x02],
+    heads = [
+      pesHeader(false, 1000, 2),
+      pesHeader(false, 5000, 2),
+      // dragging to the same seeked spot a second time is idempotent
+      pesHeader(false, 5000001000, 2),
+      pesHeader(false, 5000001000, 2)
+    ];
+
+  timestampRolloverStream.on('data', function(packet) {
+    packets.push(packet);
+  });
+
+  while (heads.length > 0) {
+    elementaryStream.push({
+      type: 'pes',
+      streamType: ADTS_STREAM_TYPE,
+      payloadUnitStartIndicator: true,
+      data: new Uint8Array(heads.shift().concat(packetData))
+    });
+  }
+  elementaryStream.flush();
+
+  assert.equal(packets[0].pts, 1000, 'first frame');
+  assert.equal(packets[1].pts, 5000, 'does not inflate a small adjacent step by a full circle');
+  assert.equal(packets[2].pts, 5000001000, 'seek stays on the wire');
+  assert.equal(packets[3].pts, 5000001000, 'repeating the seek is idempotent');
+});
+
 QUnit.module('H264 Stream', {
   beforeEach: function() {
     h264Stream = new H264Stream();
